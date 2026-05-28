@@ -1,0 +1,31 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# dbt
+ecommerce_dbt/target/
+ecommerce_dbt/logs/
+ecommerce_dbt/.dbt/
+
+# Docker volumes (local bind mounts)
+docker/logs/
+docker/minio/data/
+docker/postgres/data/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db

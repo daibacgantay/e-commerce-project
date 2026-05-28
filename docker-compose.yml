@@ -1,0 +1,279 @@
+version: "3.9"
+
+# ─── Shared network ───────────────────────────────────────────────────────────
+networks:
+  ecommerce-net:
+    driver: bridge
+
+# ─── Named volumes ────────────────────────────────────────────────────────────
+volumes:
+  postgres-data:
+  kafka-data:
+  minio-data:
+  airflow-logs:
+
+# ─── Airflow common config (YAML anchor) ─────────────────────────────────────
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: dockerfile-airflow.dockerfile
+  environment:
+    &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow"
+    AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW_FERNET_KEY}"
+    AIRFLOW__WEBSERVER__SECRET_KEY: "${AIRFLOW_SECRET_KEY}"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+    # Airflow 3.0 extracted FabAuthManager to apache-airflow-providers-fab.
+    # Must set this explicitly so the webserver and 'airflow users create' work.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    # Downstream credentials forwarded to DAG containers
+    SNOWFLAKE_ACCOUNT: "${SNOWFLAKE_ACCOUNT}"
+    SNOWFLAKE_USER: "${SNOWFLAKE_USER}"
+    SNOWFLAKE_PASSWORD: "${SNOWFLAKE_PASSWORD}"
+    SNOWFLAKE_DATABASE: "${SNOWFLAKE_DATABASE}"
+    SNOWFLAKE_WAREHOUSE: "${SNOWFLAKE_WAREHOUSE}"
+    SNOWFLAKE_SCHEMA: "${SNOWFLAKE_SCHEMA}"
+    SNOWFLAKE_ROLE: "${SNOWFLAKE_ROLE}"
+    MINIO_ENDPOINT: "http://minio:9000"
+    MINIO_ACCESS_KEY: "${MINIO_ROOT_USER}"
+    MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+    MINIO_BUCKET: "${MINIO_BUCKET}"
+  volumes:
+    - ./docker/dags:/opt/airflow/dags
+    - airflow-logs:/opt/airflow/logs
+  networks:
+    - ecommerce-net
+
+# ═════════════════════════════════════════════════════════════════════════════
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  # Runs both the source (ecommerce) and Airflow metadata (airflow) databases.
+  # wal_level=logical is required by Debezium CDC.
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # 00_ runs first (alphabetical), creates the airflow database
+      - ./postgres/00_create_airflow_db.sql:/docker-entrypoint-initdb.d/00_create_airflow_db.sql
+      # schema.sql creates source tables in the ecommerce database
+      - ./postgres/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    networks:
+      - ecommerce-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Kafka (KRaft — no Zookeeper) ────────────────────────────────────────────
+  # Single-node broker+controller. CLUSTER_ID must be a fixed 22-char base64url
+  # string; changing it after first start will corrupt the log directory.
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      CLUSTER_ID: "${KAFKA_CLUSTER_ID}"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "${KAFKA_BROKER_PORT}:9092"
+    networks:
+      - ecommerce-net
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Confluent Schema Registry ────────────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: schema-registry
+    hostname: schema-registry
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "PLAINTEXT://kafka:9092"
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+    ports:
+      - "8081:8081"
+    networks:
+      - ecommerce-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Kafka Connect + Debezium ─────────────────────────────────────────────────
+  # Uses JSON converter (no Avro) so Schema Registry is optional for CDC.
+  # Register the PostgreSQL source connector via kafka-debezium/register_connector.py
+  # after this service is healthy.
+  kafka-connect:
+    image: debezium/connect:2.6
+    container_name: kafka-connect
+    hostname: kafka-connect
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:9092"
+      GROUP_ID: "debezium-connect-group"
+      CONFIG_STORAGE_TOPIC: "debezium.connect.configs"
+      OFFSET_STORAGE_TOPIC: "debezium.connect.offsets"
+      STATUS_STORAGE_TOPIC: "debezium.connect.status"
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "8083:8083"
+    networks:
+      - ecommerce-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── MinIO (S3-compatible data lake) ─────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    hostname: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+    volumes:
+      - minio-data:/data
+    ports:
+      - "${MINIO_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    networks:
+      - ecommerce-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── MinIO Init (create bucket) ───────────────────────────────────────────────
+  # One-shot container: creates the bronze bucket then exits.
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+      MINIO_BUCKET: "${MINIO_BUCKET}"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD &&
+        mc mb --ignore-existing local/$MINIO_BUCKET &&
+        echo "Bucket '$MINIO_BUCKET' is ready"
+    networks:
+      - ecommerce-net
+
+  # ── Airflow Init ─────────────────────────────────────────────────────────────
+  # One-shot: migrates the DB schema and creates the admin user, then exits.
+  # airflow-webserver and airflow-scheduler wait for this to complete.
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *airflow-env
+    command:
+      - bash
+      - -c
+      - >-
+        airflow db migrate &&
+        (airflow users create
+        --username "${AIRFLOW_ADMIN_USER}"
+        --password "${AIRFLOW_ADMIN_PASSWORD}"
+        --firstname Admin
+        --lastname User
+        --role Admin
+        --email admin@example.com
+        || echo "User already exists, skipping.")
+    restart: on-failure
+
+  # ── Airflow Webserver ─────────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: airflow api-server
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  # ── Airflow Scheduler ─────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: airflow scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
