@@ -6,7 +6,7 @@ import time
 from db import get_connection
 
 DATA_DIR = Path(__file__).parent.parent / "data"
-SPEED = 7200
+SPEED = 80000
 
 def parse_dt(value):#convert string to timestamp
     if not value:

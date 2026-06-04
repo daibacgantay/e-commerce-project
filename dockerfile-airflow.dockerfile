@@ -11,7 +11,8 @@ RUN PYTHON_VER=$(python --version | cut -d' ' -f2 | cut -d'.' -f1,2) && \
         apache-airflow-providers-fab \
         apache-airflow-providers-snowflake \
         apache-airflow-providers-amazon \
-        boto3
+        boto3 \
+        psycopg2-binary
 
 # Install dbt-snowflake in an isolated virtual environment.
 # dbt-core has its own dependency tree (agate, jinja2 pins, etc.) that

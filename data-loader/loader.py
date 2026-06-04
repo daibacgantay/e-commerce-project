@@ -57,20 +57,15 @@ def read_csv(filename, columns): #read csv and return list of tuple [(a,b,c), (d
 
 
 def upsert(cur, table, columns, rows, has_pk): #wrtite ddl and execute
-    # Bước 1 — build các phần của câu SQL
+    
     cols         = ", ".join(columns)
     placeholders = ", ".join(["%s"] * len(columns))
-
-    # Bước 2 — ghép thành câu INSERT hoàn chỉnh
     sql = f"INSERT INTO {table} ({cols}) VALUES %s"
-
-    # Bước 3 — thêm đuôi tùy theo has_pk
     if has_pk:
         sql += " ON CONFLICT DO NOTHING"
     else:
         cur.execute(f"TRUNCATE {table}")
 
-    # Bước 4 — thực thi với toàn bộ rows
     execute_values(cur, sql, rows, page_size=1000)
 
 

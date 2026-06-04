@@ -1,0 +1,30 @@
+version: 2
+
+sources:
+  - name: bronze
+    database: ECOMMERCE
+    schema: bronze
+    tables:
+      - name: orders
+        description: "Raw orders from CDC pipeline, includes status transitions"
+
+      - name: order_items
+        description: "Items within each order"
+
+      - name: order_payments
+        description: "Payment records per order"
+
+      - name: order_reviews
+        description: "Customer reviews per order"
+
+      - name: customers
+        description: "Customer reference data"
+
+      - name: products
+        description: "Product catalog"
+
+      - name: sellers
+        description: "Seller reference data"
+
+      - name: geolocation
+        description: "Zip code to lat/lng mapping"

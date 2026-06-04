@@ -1,0 +1,32 @@
+name: 'ecommerce_dbt'
+version: '1.0.0'
+config-version: 2
+
+profile: 'ecommerce_dbt'
+
+model-paths: ["models"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  ecommerce_dbt:
+    staging:
+      +materialized: ephemeral
+
+    intermediate:
+      +materialized: table
+      +schema: silver
+
+    marts:
+      dimensions:
+        +materialized: table
+        +schema: gold
+      facts:
+        +materialized: incremental
+        +schema: gold
