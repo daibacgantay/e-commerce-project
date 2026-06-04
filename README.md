@@ -4,7 +4,7 @@ A production-ready data pipeline built on the Brazilian Olist e-commerce dataset
 
 ## Architecture
 
-<img src="assets/architecture.png" width="800"/>
+<img src="assets/Blank diagram.png" width="800"/>
 
 ## Tech Stack
 
