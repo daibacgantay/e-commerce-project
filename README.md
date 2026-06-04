@@ -3,32 +3,8 @@
 A production-ready data pipeline built on the Brazilian Olist e-commerce dataset, simulating real-time streaming via CDC (Change Data Capture).
 
 ## Architecture
-<img src="assets/Blank diagram.png" width="800"/>
-PostgreSQL (source)
-     │
-     ▼
-Debezium CDC ──► Kafka KRaft + Schema Registry
-                      │
-                      ▼
-               Consumer (Python)
-                      │
-                      ▼
-                    MinIO
-               (Data Lake / Bronze)
-                      │
-                      ▼
-               Airflow 3.0 DAGs
-                      │
-                      ▼
-                  Snowflake
-          ┌─────────────────────────┐
-          │  Bronze → Silver → Gold │
-          └─────────────────────────┘
-                      │
-                      ▼
-              dbt transformations
-         (staging → intermediate → marts)
-```
+
+<img src="assets/architecture.png" width="800"/>
 
 ## Tech Stack
 
