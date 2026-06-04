@@ -3,12 +3,7 @@
 A production-ready data pipeline built on the Brazilian Olist e-commerce dataset, simulating real-time streaming via CDC (Change Data Capture).
 
 ## Architecture
-
-
-
 <img src="assets/Blank diagram.png" width="800"/>
-
-
 PostgreSQL (source)
      │
      ▼
